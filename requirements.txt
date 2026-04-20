@@ -1,0 +1,8 @@
+# Python 3.12
+torch
+transformers==4.51.3
+datasets
+huggingface_hub
+trl==0.17.0
+peft==0.15.2
+accelerate==1.7.0

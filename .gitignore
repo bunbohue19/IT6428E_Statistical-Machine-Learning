@@ -1,0 +1,7 @@
+# Files
+*.env
+
+# Folders
+__pycache__/
+huggingface/
+data/
