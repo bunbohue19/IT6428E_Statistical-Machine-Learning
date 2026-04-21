@@ -1,4 +1,6 @@
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 export HF_HOME="../huggingface"
 
-python Online-DPO.py
+# python DPO.py
+# python KTO.py
+python RLOO.py

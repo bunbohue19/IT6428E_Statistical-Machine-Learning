@@ -29,7 +29,7 @@ from trl import RLOOConfig, RLOOTrainer
 
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(__file__), "..", "huggingface"))
 
-MODEL_ID = "google/gemma-3-1b-it"
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 DATA_ID  = "openai/gsm8k"
 OUT_DIR  = os.path.join(os.path.dirname(__file__), "..", "results", "rloo")
 
