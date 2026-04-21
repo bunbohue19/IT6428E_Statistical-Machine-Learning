@@ -230,7 +230,7 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPO on GSM8k")
     parser.add_argument("--lr",             type=float, default=1e-5)
-    parser.add_argument("--batch_size",     type=int,   default=4)
+    parser.add_argument("--batch_size",     type=int,   default=2)
     parser.add_argument("--epochs",         type=int,   default=1)
     parser.add_argument("--ppo_epochs",     type=int,   default=4,   help="PPO mini-epochs per rollout batch")
     parser.add_argument("--max_new_tokens", type=int,   default=256)
