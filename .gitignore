@@ -1,9 +1,9 @@
 # Files
 *.env
-.bin
-.pt
-.pth
-.safetensors
+*.bin
+*.pt
+*.pth
+*.safetensors
 
 # Folders
 __pycache__/
