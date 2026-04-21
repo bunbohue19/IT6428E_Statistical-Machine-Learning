@@ -1,7 +1,12 @@
 # Files
 *.env
+*.bin
+*.pt
+*.pth
+*.safetensors
 
 # Folders
 __pycache__/
 huggingface/
 data/
+
