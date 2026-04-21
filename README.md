@@ -1,6 +1,6 @@
 # SML — LLM Alignment Training Framework
 
-A research implementation comparing five LLM alignment techniques applied to the [GSM8k](https://huggingface.co/datasets/openai/gsm8k) math reasoning benchmark using [Gemma-3-1b-it](https://huggingface.co/google/gemma-3-1b-it) as the base model.
+A research implementation comparing five LLM alignment techniques applied to the [GSM8k](https://huggingface.co/datasets/openai/gsm8k) math reasoning benchmark using [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) as the base model.
 
 ## Methods
 
