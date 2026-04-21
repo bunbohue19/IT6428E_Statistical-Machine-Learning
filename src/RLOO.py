@@ -6,7 +6,7 @@ a leave-one-out baseline: for K completions per prompt, the baseline for
 completion i is the mean reward of the other K-1 completions.
 
 This implementation uses TRL's RLOOTrainer with:
-  - A LoRA-adapted Gemma-3-1b-it as the policy
+  - A LoRA-adapted Qwen2.5-0.5B-Instruct as the policy
   - A frozen copy of the base model as the reference policy (KL constraint)
   - A callable rule-based reward function: +1 if the numeric answer matches
     the ground truth (#### N), −1 otherwise
@@ -61,9 +61,9 @@ def rloo_reward_fn(decoded_sequences: list[str]) -> list[float]:
 
     Receives full decoded sequences (prompt + response) and returns a scalar
     reward per sequence.  The question is extracted from the user turn of the
-    Gemma chat format so that the ground-truth answer can be looked up.
+    Qwen chat format so that the ground-truth answer can be looked up.
 
-    Gemma decoded format (skip_special_tokens=True):
+    Qwen decoded format (skip_special_tokens=True):
         "user\\nQUESTION\\nmodel\\nRESPONSE"
     """
     rewards = []
