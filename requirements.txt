@@ -6,3 +6,4 @@ huggingface_hub
 trl==0.17.0
 peft==0.15.2
 accelerate==1.7.0
+matplotlib

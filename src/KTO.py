@@ -152,7 +152,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="KTO on GSM8k")
-    parser.add_argument("--lr",          type=float, default=5e-5)
+    parser.add_argument("--lr",          type=float, default=1e-5)
     parser.add_argument("--batch_size",  type=int,   default=4)
     parser.add_argument("--grad_accum",  type=int,   default=4)
     parser.add_argument("--epochs",      type=int,   default=1)

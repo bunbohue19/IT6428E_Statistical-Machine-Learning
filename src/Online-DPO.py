@@ -146,10 +146,14 @@ def main(args: argparse.Namespace) -> None:
     raw      = load_dataset(DATA_ID, "main")
     gt_map   = build_gt_map(raw["train"])
     train_ds = build_prompt_dataset(raw["train"], tokenizer, args.num_samples)
-    eval_ds  = build_prompt_dataset(raw["test"],  tokenizer, max_samples=200)
     judge    = GSM8kJudge(gt_map)
 
     # ── OnlineDPO config ─────────────────────────────────────────────────────
+    # NOTE: eval is disabled here. OnlineDPO eval datasets are prompt-only
+    # (completions are generated on-the-fly), but HF Trainer's built-in
+    # evaluation_loop calls model(**inputs) expecting input_ids/labels and
+    # crashes at epoch-end, which also skips the epoch-end save. Post-hoc
+    # evaluation is handled by src/evaluate.py.
     cfg = OnlineDPOConfig(
         output_dir=OUT_DIR,
         num_train_epochs=args.epochs,
@@ -162,8 +166,9 @@ def main(args: argparse.Namespace) -> None:
         max_length=1024,
         loss_type="sigmoid",        # standard DPO loss
         logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_strategy="no",
+        save_strategy="steps",
+        save_steps=200,
         save_total_limit=2,
         report_to="none",
     )
@@ -176,21 +181,23 @@ def main(args: argparse.Namespace) -> None:
         judge=judge,
         args=cfg,
         train_dataset=train_ds,
-        eval_dataset=eval_ds,
         processing_class=tokenizer,
         peft_config=lora_cfg,
     )
 
-    trainer.train()
-    trainer.save_model(OUT_DIR)
-    tokenizer.save_pretrained(OUT_DIR)
-    print(f"Saved to {OUT_DIR}")
+    try:
+        trainer.train()
+    finally:
+        # Always persist whatever progress exists, even if training raises.
+        trainer.save_model(OUT_DIR)
+        tokenizer.save_pretrained(OUT_DIR)
+        print(f"Saved to {OUT_DIR}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Online DPO on GSM8k")
     parser.add_argument("--lr",             type=float, default=1e-5)
-    parser.add_argument("--batch_size",     type=int,   default=2)
+    parser.add_argument("--batch_size",     type=int,   default=4)
     parser.add_argument("--grad_accum",     type=int,   default=2)
     parser.add_argument("--epochs",         type=int,   default=1)
     parser.add_argument("--beta",           type=float, default=0.1)

@@ -55,15 +55,16 @@ def build_prompts(questions: list[str], tokenizer) -> list[str]:
     return prompts
 
 
-def sequence_logprobs(
+def token_logprobs(
     logits: torch.Tensor,       # (B, T, V)
     input_ids: torch.Tensor,    # (B, T)
     response_mask: torch.Tensor # (B, T)
-) -> torch.Tensor:
-    """Sum of log-probabilities over response tokens."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token log-probabilities and the shifted response mask (B, T-1)."""
     lp = F.log_softmax(logits[:, :-1, :], dim=-1)          # (B, T-1, V)
     token_lp = lp.gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # (B, T-1)
-    return (token_lp * response_mask[:, 1:]).sum(-1)        # (B,)
+    mask = response_mask[:, 1:].float()                    # (B, T-1)
+    return token_lp, mask
 
 
 def main(args: argparse.Namespace) -> None:
@@ -158,37 +159,45 @@ def main(args: argparse.Namespace) -> None:
                 old_logits, _, _ = policy(
                     input_ids=full_ids, attention_mask=attn_mask
                 )
-                old_lp = sequence_logprobs(old_logits, full_ids, resp_mask)
+                old_token_lp, mask_shift = token_logprobs(old_logits, full_ids, resp_mask)
 
                 ref_logits, _, _ = ref_policy(
                     input_ids=full_ids, attention_mask=attn_mask
                 )
-                ref_lp = sequence_logprobs(ref_logits, full_ids, resp_mask)
+                ref_token_lp, _ = token_logprobs(ref_logits, full_ids, resp_mask)
 
-            kl = (old_lp - ref_lp).detach()               # approximate KL
+            # Sequence-level KL (sum of per-token differences on response tokens)
+            kl = ((old_token_lp - ref_token_lp) * mask_shift).sum(-1).detach()
             advantages = rewards - args.kl_coef * kl
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Guard against degenerate batches where all rewards are identical:
+            # dividing by a near-zero std explodes the advantages.
+            adv_std = advantages.std()
+            if advantages.numel() > 1 and adv_std > 1e-4:
+                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            else:
+                advantages = advantages - advantages.mean()
 
             # ── PPO mini-epochs ────────────────────────────────────────────
             for _ in range(args.ppo_epochs):
                 new_logits, _, new_values = policy(
                     input_ids=full_ids, attention_mask=attn_mask
                 )
-                new_lp = sequence_logprobs(new_logits, full_ids, resp_mask)
+                new_token_lp, _ = token_logprobs(new_logits, full_ids, resp_mask)
 
-                ratio         = torch.exp(new_lp - old_lp.detach())
+                # Per-token ratio — avoids exp(sum-over-256-tokens) blow-up
+                log_ratio     = new_token_lp - old_token_lp.detach()
+                ratio         = torch.exp(log_ratio)
                 clipped_ratio = torch.clamp(ratio, 1 - args.clip_range, 1 + args.clip_range)
-                policy_loss   = -torch.min(
-                    ratio * advantages.detach(),
-                    clipped_ratio * advantages.detach(),
-                ).mean()
 
-                # Value loss: predict scalar reward for each response token
+                adv_bt        = advantages.detach().unsqueeze(-1)  # (B, 1) → broadcast
+                pg_losses     = -torch.min(ratio * adv_bt, clipped_ratio * adv_bt)
+                denom         = mask_shift.sum().clamp_min(1.0)
+                policy_loss   = (pg_losses * mask_shift).sum() / denom
+
+                # Value loss: MSE against scalar reward, only on response tokens
                 val_seq    = new_values[:, :-1].squeeze(-1)  # (B, T-1)
-                val_target = rewards.unsqueeze(1).expand_as(val_seq) * resp_mask[:, 1:].float()
-                value_loss = F.mse_loss(
-                    val_seq * resp_mask[:, 1:].float(), val_target
-                )
+                val_target = rewards.unsqueeze(1).expand_as(val_seq)
+                value_loss = (((val_seq - val_target) ** 2) * mask_shift).sum() / denom
 
                 loss = policy_loss + args.vf_coef * value_loss
                 optimizer.zero_grad()
@@ -218,7 +227,7 @@ def main(args: argparse.Namespace) -> None:
             f"avg_reward={total_reward/max(n_steps,1):.4f}"
         )
 
-    policy.save_pretrained(OUT_DIR)
+    policy._pretrained(OUT_DIR)
     tokenizer.save_pretrained(OUT_DIR)
 
     with open(os.path.join(OUT_DIR, "train_log.json"), "w") as f:

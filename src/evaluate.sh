@@ -24,7 +24,7 @@ export HF_HOME="$ROOT_DIR/huggingface"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 NUM_SAMPLES=-1
-BATCH_SIZE=8
+BATCH_SIZE=32
 ONLY_METHOD=""
 
 while [[ $# -gt 0 ]]; do
@@ -38,7 +38,7 @@ done
 
 # ── Methods and their result directories ─────────────────────────────────────
 declare -A METHOD_DIRS=(
-    ["baseline"]="google/gemma-3-1b-it"
+    ["baseline"]="Qwen/Qwen2.5-0.5B-Instruct"
     ["PPO"]="$RESULTS_DIR/ppo"
     ["DPO"]="$RESULTS_DIR/dpo"
     ["Online-DPO"]="$RESULTS_DIR/online_dpo"
@@ -58,7 +58,7 @@ run_eval() {
     echo "============================================================"
 
     # Skip if results directory doesn't exist (not yet trained)
-    if [[ "$model_path" != "google/"* ]] && [[ ! -d "$model_path" ]]; then
+    if [[ "$model_path" != "qwen/"* ]] && [[ ! -d "$model_path" ]]; then
         echo "  [SKIP] $model_path not found – train first."
         return
     fi
@@ -83,7 +83,7 @@ print_summary() {
         local model_path="${METHOD_DIRS[$method]}"
         local results_file
 
-        if [[ "$model_path" == "google/"* ]]; then
+        if [[ "$method" == "baseline" ]]; then
             results_file="$RESULTS_DIR/baseline/eval_results.json"
         else
             results_file="$model_path/eval_results.json"

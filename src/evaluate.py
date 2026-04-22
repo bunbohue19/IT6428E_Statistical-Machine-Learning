@@ -31,35 +31,75 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(__file__), "..", "huggingface"))
 
-BASE_MODEL_ID = "google/gemma-3-1b-it"
-DATA_ID       = "openai/gsm8k"
+DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+DATA_ID            = "openai/gsm8k"
 
-ANSWER_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+NUM = r"-?\$?\d[\d,]*(?:\.\d+)?"
+
+GT_ANSWER_RE = re.compile(rf"####\s*({NUM})")
+
+# Ordered fallback patterns for model predictions. First match wins.
+PRED_PATTERNS = [
+    re.compile(rf"####\s*({NUM})"),                          # GSM8k style
+    re.compile(rf"\\boxed\{{\s*({NUM})\s*\}}"),              # \boxed{N}
+    re.compile(rf"(?:final\s+)?answer\s*(?:is|:)\s*\**\s*({NUM})", re.IGNORECASE),
+    re.compile(rf"=\s*\**\s*({NUM})\s*\**\s*\.?\s*$", re.MULTILINE),
+]
+
+ANY_NUM_RE = re.compile(NUM)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+def _clean(s: str) -> str:
+    return s.replace(",", "").lstrip("$").rstrip(".")
 
-def extract_answer(text: str) -> str | None:
-    """Extract the final numeric answer after '####'."""
-    m = ANSWER_RE.search(text)
-    return m.group(1).replace(",", "") if m else None
+
+def _numeric_eq(a: str, b: str) -> bool:
+    """Compare two numeric strings with tolerance for trailing zeros / decimals."""
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except ValueError:
+        return a == b
+
+
+def extract_gt_answer(text: str) -> str | None:
+    """Strict: only accept the GSM8k ``####`` format (used for ground truth)."""
+    m = GT_ANSWER_RE.search(text)
+    return _clean(m.group(1)) if m else None
+
+
+def extract_pred_answer(text: str) -> str | None:
+    """Tolerant: try common answer formats, fall back to the last number."""
+    for pat in PRED_PATTERNS:
+        m = None
+        for m in pat.finditer(text):
+            pass   # keep the last match (the final answer, not an intermediate)
+        if m:
+            return _clean(m.group(1))
+    matches = ANY_NUM_RE.findall(text)
+    return _clean(matches[-1]) if matches else None
 
 
 def load_model_and_tokenizer(
     model_path: str,
-    base_model_id: str,
+    base_model_id: str | None,
     device: torch.device,
 ):
     """
     Load tokenizer and model.
 
     If *model_path* points to a directory with a PEFT adapter_config.json,
-    load the base model first and then attach the LoRA adapters.
+    load the base model first and then attach the LoRA adapters. The base
+    model is taken from ``adapter_config.json['base_model_name_or_path']``
+    unless *base_model_id* is explicitly provided (CLI override).
+
     Otherwise treat *model_path* as a standalone HuggingFace model ID / path.
     """
     adapter_config = os.path.join(model_path, "adapter_config.json")
 
     if os.path.isfile(adapter_config):
+        if base_model_id is None:
+            with open(adapter_config) as f:
+                base_model_id = json.load(f)["base_model_name_or_path"]
         print(f"Loading base model: {base_model_id}")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForCausalLM.from_pretrained(
@@ -144,7 +184,7 @@ def evaluate(args: argparse.Namespace) -> dict:
     print(f"Device: {device}")
 
     model, tokenizer = load_model_and_tokenizer(
-        args.model_path, BASE_MODEL_ID, device
+        args.model_path, args.base_model, device
     )
 
     # ── Load test set ─────────────────────────────────────────────────────
@@ -154,7 +194,7 @@ def evaluate(args: argparse.Namespace) -> dict:
         test_ds = test_ds.select(range(args.num_samples))
 
     questions = test_ds["question"]
-    gt_answers = [extract_answer(a) for a in test_ds["answer"]]
+    gt_answers = [extract_gt_answer(a) for a in test_ds["answer"]]
 
     print(f"\nEvaluating {len(questions)} test examples …\n")
     t0 = time.time()
@@ -172,8 +212,8 @@ def evaluate(args: argparse.Namespace) -> dict:
     failures: list[dict] = []
 
     for i, (resp, gt) in enumerate(zip(responses, gt_answers)):
-        pred = extract_answer(resp)
-        ok   = pred is not None and gt is not None and pred == gt
+        pred = extract_pred_answer(resp)
+        ok   = pred is not None and gt is not None and _numeric_eq(pred, gt)
         if ok:
             correct += 1
         else:
@@ -182,7 +222,7 @@ def evaluate(args: argparse.Namespace) -> dict:
                 "question":  questions[i],
                 "gt_answer": gt,
                 "predicted": pred,
-                "response":  resp[:300],
+                "response":  resp[-800:],   # tail is where the final answer lives
             })
         total += 1
 
@@ -236,6 +276,8 @@ if __name__ == "__main__":
         "--method", type=str, default="unknown",
         help="Label for this run (e.g. PPO, DPO, KTO, RLOO, Online-DPO, baseline)",
     )
+    parser.add_argument("--base_model",     type=str,   default=None,
+                        help="Override base model ID. Default: read from adapter_config.json.")
     parser.add_argument("--num_samples",    type=int,   default=-1,   help="-1 = full test set")
     parser.add_argument("--batch_size",     type=int,   default=8)
     parser.add_argument("--max_new_tokens", type=int,   default=512)
