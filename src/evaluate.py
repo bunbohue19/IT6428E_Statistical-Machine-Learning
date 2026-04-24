@@ -136,11 +136,19 @@ def generate_answers(
     """Generate one answer per question and return the decoded response strings."""
     all_responses: list[str] = []
 
+    SYSTEM_PROMPT = (
+        "Solve the math problem step by step. "
+        "At the end, write your final answer on its own line in the format: #### <number>"
+    )
+
     for start in range(0, len(questions), batch_size):
         batch_qs = questions[start : start + batch_size]
         prompts  = [
             tokenizer.apply_chat_template(
-                [{"role": "user", "content": q}],
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": q},
+                ],
                 tokenize=False,
                 add_generation_prompt=True,
             )

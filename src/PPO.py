@@ -12,6 +12,7 @@ import os
 import re
 import json
 import argparse
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -20,34 +21,81 @@ from peft import LoraConfig, TaskType
 from transformers import AutoTokenizer
 from trl import AutoModelForCausalLMWithValueHead, create_reference_model
 
+# Qwen2.5's sliding_window == max_position_embeddings → full attention in practice.
+warnings.filterwarnings("ignore", message="Sliding Window Attention")
+
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(__file__), "..", "huggingface"))
+
+# Free throughput boost on Ampere/Hopper/Blackwell GPUs (RTX 30xx/40xx/50xx)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32       = True
 
 MODEL_ID  = "Qwen/Qwen2.5-0.5B-Instruct"
 DATA_ID   = "openai/gsm8k"
 OUT_DIR   = os.path.join(os.path.dirname(__file__), "..", "results", "ppo")
 
-ANSWER_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+_NUM = r"-?\$?\d[\d,]*(?:\.\d+)?"
+_GT_RE = re.compile(rf"####\s*({_NUM})")
+_PRED_PATTERNS = [
+    re.compile(rf"####\s*({_NUM})"),
+    re.compile(rf"\\boxed\{{\s*({_NUM})\s*\}}"),
+    re.compile(rf"(?:final\s+)?answer\s*(?:is|:)\s*\**\s*({_NUM})", re.IGNORECASE),
+    re.compile(rf"=\s*\**\s*({_NUM})\s*\**\s*\.?\s*$", re.MULTILINE),
+]
+_ANY_NUM_RE = re.compile(_NUM)
 
 
-def extract_answer(text: str) -> str | None:
-    m = ANSWER_RE.search(text)
-    return m.group(1).replace(",", "") if m else None
+def _clean(s: str) -> str:
+    return s.replace(",", "").lstrip("$").rstrip(".")
+
+
+def _numeric_eq(a: str, b: str) -> bool:
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except ValueError:
+        return a == b
+
+
+def extract_gt_answer(text: str) -> str | None:
+    m = _GT_RE.search(text)
+    return _clean(m.group(1)) if m else None
+
+
+def extract_pred_answer(text: str) -> str | None:
+    """Lenient: try common answer formats, fall back to the last number."""
+    for pat in _PRED_PATTERNS:
+        last = None
+        for last in pat.finditer(text):
+            pass
+        if last:
+            return _clean(last.group(1))
+    matches = _ANY_NUM_RE.findall(text)
+    return _clean(matches[-1]) if matches else None
 
 
 def compute_rewards(responses: list[str], ground_truths: list[str]) -> torch.Tensor:
     rewards = []
     for resp, gt in zip(responses, ground_truths):
-        pred   = extract_answer(resp)
-        gt_ans = extract_answer(gt)
-        rewards.append(1.0 if (pred and gt_ans and pred == gt_ans) else -1.0)
+        pred   = extract_pred_answer(resp)
+        gt_ans = extract_gt_answer(gt)
+        rewards.append(1.0 if (pred and gt_ans and _numeric_eq(pred, gt_ans)) else -1.0)
     return torch.tensor(rewards, dtype=torch.float32)
+
+
+SYSTEM_PROMPT = (
+    "Solve the math problem step by step. "
+    "At the end, write your final answer on its own line in the format: #### <number>"
+)
 
 
 def build_prompts(questions: list[str], tokenizer) -> list[str]:
     prompts = []
     for q in questions:
         p = tokenizer.apply_chat_template(
-            [{"role": "user", "content": q}],
+            [
+                {"role": "system",  "content": SYSTEM_PROMPT},
+                {"role": "user",    "content": q},
+            ],
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -101,6 +149,10 @@ def main(args: argparse.Namespace) -> None:
     ref_policy.to(device)
     ref_policy.eval()
 
+    if args.compile:
+        policy.pretrained_model     = torch.compile(policy.pretrained_model,     dynamic=True)
+        ref_policy.pretrained_model = torch.compile(ref_policy.pretrained_model, dynamic=True)
+
     # ── Dataset ──────────────────────────────────────────────────────────────
     ds = load_dataset(DATA_ID, "main")
     train_ds = ds["train"]
@@ -116,7 +168,7 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(args.epochs):
         policy.train()
-        total_reward, total_loss, n_steps = 0.0, 0.0, 0
+        total_reward, total_policy_loss, total_value_loss, n_steps = 0.0, 0.0, 0.0, 0
 
         for start in range(0, len(train_ds), args.batch_size):
             batch        = train_ds[start : start + args.batch_size]
@@ -194,32 +246,39 @@ def main(args: argparse.Namespace) -> None:
                 denom         = mask_shift.sum().clamp_min(1.0)
                 policy_loss   = (pg_losses * mask_shift).sum() / denom
 
+                # Entropy bonus: subtract from loss to encourage exploration
+                entropy    = -(new_token_lp * mask_shift).sum() / denom
+
                 # Value loss: MSE against scalar reward, only on response tokens
                 val_seq    = new_values[:, :-1].squeeze(-1)  # (B, T-1)
                 val_target = rewards.unsqueeze(1).expand_as(val_seq)
                 value_loss = (((val_seq - val_target) ** 2) * mask_shift).sum() / denom
 
-                loss = policy_loss + args.vf_coef * value_loss
+                loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-            total_reward += rewards.mean().item()
-            total_loss   += loss.item()
-            n_steps      += 1
+            total_reward      += rewards.mean().item()
+            total_policy_loss += policy_loss.item()
+            total_value_loss  += value_loss.item()
+            n_steps           += 1
 
             log_history.append({
                 "step":        n_steps,
                 "epoch":       epoch + start / len(train_ds),
-                "loss":        loss.item(),
+                "policy_loss": policy_loss.item(),
+                "value_loss":  value_loss.item(),
                 "mean_reward": rewards.mean().item(),
             })
 
             if n_steps % 20 == 0:
                 print(
                     f"[epoch {epoch+1}] step {n_steps:4d} | "
-                    f"reward={total_reward/n_steps:.3f} | loss={total_loss/n_steps:.4f}"
+                    f"reward={total_reward/n_steps:.3f} | "
+                    f"pg_loss={total_policy_loss/n_steps:.4f} | "
+                    f"vf_loss={total_value_loss/n_steps:.4f}"
                 )
 
         print(
@@ -227,7 +286,7 @@ def main(args: argparse.Namespace) -> None:
             f"avg_reward={total_reward/max(n_steps,1):.4f}"
         )
 
-    policy._pretrained(OUT_DIR)
+    policy.save_pretrained(OUT_DIR)
     tokenizer.save_pretrained(OUT_DIR)
 
     with open(os.path.join(OUT_DIR, "train_log.json"), "w") as f:
@@ -239,15 +298,17 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPO on GSM8k")
     parser.add_argument("--lr",             type=float, default=1e-5)
-    parser.add_argument("--batch_size",     type=int,   default=2)
+    parser.add_argument("--batch_size",     type=int,   default=8,  help="Rollout + update batch size")
     parser.add_argument("--epochs",         type=int,   default=1)
-    parser.add_argument("--ppo_epochs",     type=int,   default=4,   help="PPO mini-epochs per rollout batch")
+    parser.add_argument("--ppo_epochs",     type=int,   default=2,   help="PPO mini-epochs per rollout batch")
     parser.add_argument("--max_new_tokens", type=int,   default=256)
     parser.add_argument("--temperature",    type=float, default=0.7)
-    parser.add_argument("--kl_coef",        type=float, default=0.1,  help="KL penalty coefficient")
+    parser.add_argument("--kl_coef",        type=float, default=0.5,  help="KL penalty coefficient")
     parser.add_argument("--clip_range",     type=float, default=0.2,  help="PPO clip epsilon")
-    parser.add_argument("--vf_coef",        type=float, default=0.5,  help="Value-head loss coefficient")
+    parser.add_argument("--vf_coef",        type=float, default=0.0,  help="Value-head loss coefficient (0 = disabled; this PPO uses raw-reward advantages, no value baseline)")
+    parser.add_argument("--ent_coef",       type=float, default=0.01, help="Entropy bonus coefficient")
     parser.add_argument("--max_grad_norm",  type=float, default=1.0)
     parser.add_argument("--num_samples",    type=int,   default=-1,   help="-1 = full dataset")
+    parser.add_argument("--compile",        action="store_true",       help="torch.compile the model for faster forward/backward")
     args = parser.parse_args()
     main(args)
